@@ -4,6 +4,12 @@ from sqlalchemy import create_engine
 from datetime import date, timedelta
 from streamlit_lottie import st_lottie
 import requests
+import atexit
+import asyncio
+import warnings
+
+# Suppress specific warnings (optional)
+warnings.filterwarnings("ignore", message=".*Event loop is closed.*")
 
 # Configure Streamlit page
 st.set_page_config(
@@ -14,10 +20,23 @@ st.set_page_config(
 
 # Function to load Lottie animations
 def load_lottieurl(url: str):
-    r = requests.get(url)
-    if r.status_code != 200:
+    """
+    Load a Lottie animation from a URL.
+
+    Args:
+        url (str): URL of the Lottie JSON file.
+
+    Returns:
+        dict or None: JSON data of the Lottie animation or None if failed.
+    """
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        st.error(f"Failed to load Lottie animation: {e}")
         return None
-    return r.json()
 
 # Load Lottie animation
 lottie_coffee = load_lottieurl("https://assets10.lottiefiles.com/packages/lf20_jcikwtux.json")
@@ -34,16 +53,44 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Setup database connection
+# Setup database connection with error handling
 @st.cache_resource
 def init_connection():
-    engine = create_engine(st.secrets["databases"]["postgres_url"])
-    return engine
+    """
+    Initialize the database connection using SQLAlchemy.
+
+    Returns:
+        sqlalchemy.engine.Engine: SQLAlchemy engine instance.
+
+    Raises:
+        KeyError: If the required secret is missing.
+        Exception: For any other exceptions during connection.
+    """
+    try:
+        postgres_url = st.secrets["databases"]["postgres_url"]
+        engine = create_engine(postgres_url)
+        return engine
+    except KeyError as e:
+        st.error(f"Missing secret key: {e}. Please set it in Streamlit Cloud secrets.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Failed to connect to the database: {e}")
+        st.stop()
 
 engine = init_connection()
 
-# Fetch distinct machine names and customers based on date range
+# Function to fetch distinct machine names and customers based on date range
 def fetch_distinct_values(start_date, end_date):
+    """
+    Fetch distinct machine names and customers within the specified date range.
+
+    Args:
+        start_date (date): Start date.
+        end_date (date): End date.
+
+    Returns:
+        tuple: Sorted lists of machine names and customers.
+    """
     query = """
     SELECT DISTINCT machine.machine_name, sku.customer
     FROM daily_production dp
@@ -52,14 +99,30 @@ def fetch_distinct_values(start_date, end_date):
     WHERE dp.date BETWEEN %(start_date)s AND %(end_date)s
     ORDER BY machine.machine_name, sku.customer
     """
-    with engine.connect() as connection:
-        df = pd.read_sql_query(query, connection, params={'start_date': start_date, 'end_date': end_date})
-    machine_names = sorted(df['machine_name'].dropna().unique())
-    customers = sorted(df['customer'].dropna().unique())
-    return machine_names, customers
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql_query(query, connection, params={'start_date': start_selected, 'end_date': end_selected})
+        machine_names = sorted(df['machine_name'].dropna().unique())
+        customers = sorted(df['customer'].dropna().unique())
+        return machine_names, customers
+    except Exception as e:
+        st.error(f"Error fetching distinct values: {e}")
+        st.stop()
 
-# Fetch production data with proper connection management and dynamic filters
+# Function to fetch production data with dynamic filters
 def fetch_production_data(start_date, end_date, machine=None, customer=None):
+    """
+    Fetch production data based on the selected filters.
+
+    Args:
+        start_date (date): Start date.
+        end_date (date): End date.
+        machine (str, optional): Machine name filter.
+        customer (str, optional): Customer filter.
+
+    Returns:
+        pd.DataFrame: Filtered production data.
+    """
     base_query = """
     SELECT 
         dp.date, dp.schedulded_cases, dp.produced_cases, 
@@ -87,19 +150,35 @@ def fetch_production_data(start_date, end_date, machine=None, customer=None):
     
     base_query += " ORDER BY dp.date, machine.machine_name"
     
-    with engine.connect() as connection:
-        df = pd.read_sql_query(base_query, connection, params=params)
-    
-    # Convert numeric columns to appropriate types
-    numeric_columns = ['schedulded_cases', 'produced_cases', 'arabica', 'robusta', 'brazil']
-    for col in numeric_columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Optionally remove leading zeroes from 'sku_of_product' if not part of identifier
-    # Uncomment the following line if needed
-    # df['sku_of_product'] = df['sku_of_product'].astype(str).str.lstrip('0')
-    
-    return df
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql_query(base_query, connection, params=params)
+        
+        # Convert numeric columns to appropriate types
+        numeric_columns = ['schedulded_cases', 'produced_cases', 'arabica', 'robusta', 'brazil']
+        for col in numeric_columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Optionally remove leading zeroes from 'sku_of_product' if not part of identifier
+        # Uncomment the following line if needed
+        # df['sku_of_product'] = df['sku_of_product'].astype(str).str.lstrip('0')
+        
+        return df
+    except Exception as e:
+        st.error(f"Error fetching production data: {e}")
+        st.stop()
+
+# Function to stop the event loop gracefully
+def stop_event_loop():
+    try:
+        loop = asyncio.get_event_loop()
+        if not loop.is_closed():
+            loop.stop()
+    except Exception as e:
+        st.error(f"Error stopping event loop: {e}")
+
+# Register the shutdown function
+atexit.register(stop_event_loop)
 
 # Sidebar filters
 with st.sidebar:
@@ -172,6 +251,9 @@ if not data.empty:
     total_brazil = data["total_brazil"].sum()
     total_coffee = total_arabica + total_robusta + total_brazil
 
+    # Production Efficiency
+    production_efficiency = (total_produced / total_scheduled) * 100 if total_scheduled > 0 else 0
+
     # KPIs Section
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("### 🎯 Key Performance Indicators", unsafe_allow_html=True)
@@ -191,6 +273,10 @@ if not data.empty:
     # Additional KPI for Machines Involved
     kpi7, = st.columns(1)
     kpi7.metric("🖥️ Machines Involved", f"{data['machine_name'].nunique()}")
+
+    # Production Efficiency KPI
+    kpi8, = st.columns(1)
+    kpi8.metric("⚙️ Production Efficiency", f"{production_efficiency:.2f}%")
 
     # Charts Section
     st.markdown("<hr>", unsafe_allow_html=True)
